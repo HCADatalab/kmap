@@ -39,9 +39,9 @@
         (finally (doto zk .stop .close))))
       (finally (.setLevel (org.apache.log4j.Logger/getRootLogger) lvl)))))
 
-;(def statsd-metrics (atom {}))
+(def statsd-metrics (atom {}))
 
-#_(defn with-statsd-server [f]
+(defn with-statsd-server [f]
   (let [alive (atom true)]
     (a/thread
       (let [buf (byte-array 2048)
@@ -62,7 +62,7 @@
   (reset! statsd/cfg nil)
   (f))
 
-(use-fixtures :once with-kafka) ;with-statsd-server)
+(use-fixtures :once with-kafka with-statsd-server)
 (use-fixtures :each reset-clj-statsd)
 
 (defn nd-subtract1 [prev choice s]
@@ -261,78 +261,7 @@
     (when (or (seq msgs) (seq (mapcat val expected)))
       expected)))
 
-;(def statsd-period 200)
-
-#_(deftest stateful
-  (testing "Stateful worker"
-    (let [input-topic (str "test-stateful-in" (System/currentTimeMillis))
-         output-topic (str "test-stateful-out" (System/currentTimeMillis))
-         state-topic (str "test-stateful-state" (System/currentTimeMillis))
-         N 100 ;msgs
-         running-avg
-         (fn 
-           ([] #{}) ; assumes no repeated values
-           ([ns] ns)
-           ([ns n]
-             (let [ns (conj ns n)]
-               [ns [(/ (reduce + ns) (count ns))]])))
-         exit (a/chan)
-         start-adapter
-         #(kafka-adapter running-avg
-           {:config {"group.id" "stateful"
-                     "bootstrap.servers" "localhost:9092"
-                     "auto.offset.reset" "earliest"
-                     "metadata.max.age.ms" "10000"} ; to synchronize properly for testing
-            :timeout 1000
-            :edn true
-            :exit exit
-            :input-topics [input-topic]
-            :topic-aliases {:state state-topic
-                            :out output-topic}
-            :statsd {:host "localhost" :port 8125 :period statsd-period}})
-         adapter (atom (start-adapter))]
-     (a/thread
-       (with-open [p (gregor/producer "localhost:9092")]
-         (doseq [n (range (/ N 2))]
-           (gregor/send p input-topic (str "P" (mod n 5)) (pr-str n)))
-         (.flush p)
-         (Thread/sleep 50000)
-         (a/>!! exit :shutdown)
-         (a/<!! @adapter)
-         #_(Thread/sleep 10000)
-         (reset! adapter (start-adapter))
-         (doseq [n (range (/ N 2) N)]
-           (Thread/sleep 50)
-           (gregor/send p input-topic (str "P" (mod n 5)) (pr-str n)))
-         (.flush p)))
-     (with-open [consumer (doto (gregor/consumer "localhost:9092"
-                                  "dumb-stateful"
-                                  [] {"auto.offset.reset" "earliest"
-                                      "metadata.max.age.ms" "10000"}) ; to synchronize properly for testing
-                            (.subscribe [output-topic]))]
-       (loop [expected (x/into {}
-                         (x/by-key #(str "P" (mod % 5))
-                           (comp (x/reductions conj [])
-                             (drop 1)
-                             (map (fn [ns] (/ (reduce + ns) (count ns))))
-                             (x/into [])))
-                         (range N))
-              already-received (zipmap (keys expected) (repeat #{}))]
-         (let [msgs (into {}
-                      (x/by-key #(.key %)
-                        (comp
-                          (x/for [r %
-                                  :let [v (edn/read-string (.value r))
-                                        k (.key r)]
-                                  :when (not ((already-received k) v))]
-                            v)
-                          (x/into [])))
-                      (.poll consumer 1000))]
-           (some-> expected (consume-expected msgs) (recur (merge-with into already-received msgs))))))
-     (a/close! exit)
-     (a/<!! @adapter)
-     (Thread/sleep (* 2 statsd-period)) ; Nyquist–Shannon sampling theorem :-)
-     (is (= "0" (get-in @statsd-metrics ["stateful" input-topic "0" "lag"]))))))
+(def statsd-period 200)
 
 (deftest stall
   (testing "Stall detection"
@@ -427,65 +356,6 @@
           msgs)]
     (when (or (seq msgs) (seq (mapcat val expected)))
       expected)))
-
-#_(deftest cleanup
-  (let [input-topic (str "test-cleanup-in" (System/currentTimeMillis))
-        output-topic (str "test-cleanup-out" (System/currentTimeMillis))
-        state-topic (str "test-cleanup-state" (System/currentTimeMillis))
-        N 100 ;msgs
-        accumulate
-        (fn 
-          ([] [])
-          ([acc] acc)
-          ([acc n]
-            [(conj acc n) [n]]))
-        exit (a/chan)
-        adapter
-        (kafka-adapter accumulate
-          {:config {"group.id" "cleanup"
-                    "bootstrap.servers" "localhost:9092"
-                    "auto.offset.reset" "earliest"
-                    "metadata.max.age.ms" "10000"} ; to synchronize properly for testing
-           :timeout 1000
-           :edn true
-           :exit exit
-           :worker-opts {:summarize x/max
-                         :cleanup (fn [state max]
-                                    (into [] (filter #(<= (- max 20) %)) state))}
-           :input-topics [input-topic]
-           :topic-aliases {:state state-topic
-                           :out output-topic}
-           :statsd {:host "localhost" :port 8125 :period statsd-period}})]
-    (with-open [p (gregor/producer "localhost:9092")]
-      (doseq [n (range N)]
-        (Thread/sleep 200)
-        (gregor/send p input-topic (str "P" (mod n 5)) (pr-str n)))
-      (.flush p))
-    ; wait for complete execution
-    (with-open [consumer (doto (gregor/consumer "localhost:9092"
-                                 "dumb-cleanup"
-                                 [] {"auto.offset.reset" "earliest"
-                                     "metadata.max.age.ms" "10000"}) ; to synchronize properly for testing
-                           (.subscribe [output-topic]))]
-      (loop [ns (set (range N))]
-        (when (seq ns)
-          (recur (transduce (map #(-> % .value edn/read-string)) disj ns (.poll consumer 1000))))))
-    (Thread/sleep (* 2 statsd-period)) ; Nyquist–Shannon sampling theorem :-)
-    (a/close! exit)
-    (a/<!! adapter)
-    (is (= "0" (get-in @statsd-metrics ["cleanup" input-topic "0" "lag"])))
-    (with-open [consumer (doto (gregor/consumer "localhost:9092"
-                                 "dumb-cleanup"
-                                 [] {"auto.offset.reset" "earliest"
-                                     "metadata.max.age.ms" "10000"}) ; to synchronize properly for testing
-                           (.subscribe [state-topic]))]
-      (loop [greatest -1]
-        (when (< greatest (dec N))
-          (let [states (into [] (keep #(:hcadatalab.kmap.async/value (edn/read-string (.value %)))) (.poll consumer 1000))]
-            (doseq [state states]
-              (is (= (sort state) state))
-              (is (<= (- (peek state) (first state)) 20)))
-            (recur (transduce (map peek) max greatest states))))))))
 
 #_(deftest killing-bg-thread
     (testing "Ensuring that an exception thrown in a callback can't bring down the producer."

@@ -2,7 +2,6 @@
   (:require
     [clojure.core.async :as a]
     [clojure.edn :as edn]
-;    [clojure.spec.alpha :as s]
     [gregor.core :as gregor]
     [net.cgrand.xforms :as x]
     [clj-statsd :as statsd])
@@ -10,39 +9,6 @@
     [org.apache.kafka.clients.consumer ConsumerRecord KafkaConsumer OffsetAndMetadata]
     [org.apache.kafka.clients.producer ProducerRecord KafkaProducer RecordMetadata]
     [org.apache.kafka.common TopicPartition]))
-
-
-;(s/def ::state (s/keys :req [::offset ::topic ::partition ::value ::key]))
-;(s/def ::partition int?)
-;(s/def ::offset int?)
-;(s/def ::topic string?)
-;(s/def ::value any?)
-;(s/def ::key any?)
-
-#_(def ^:private latest-state
-  "transducer that returns the latest offset (states are supposed in increasing offset) or nil if the last message has a nil value"
-  (x/reduce (fn
-              ([last-state] last-state)
-              ([_ state]
-                (when (some? (::value state))
-                  state)))
-    nil))
-
-#_(defn ^:private aggregate-latest-state [partitions auto-offset-reset]
-  (comp
-    (x/for [records %, ^ConsumerRecord record records
-            :when (some? (.value record))]
-      (edn/read-string {:default tagged-literal} (.value record)))
-    (x/transjuxt
-      ; offsets by partition are computed in a conservative manner (min of offsets for each key)
-      ; this is because/in case we get holes either because of bugs of because of an increased concurrency (key-level vs partition-level)
-      {:min-offsets-by-partition (x/into-by-key (zipmap partitions (repeat (case auto-offset-reset "earliest" :-∞ :+∞)))
-                                   #(TopicPartition. (::topic %) (::partition %)) 
-                                   (comp (x/by-key ::key (comp x/last (keep ::offset)))
-                                     ; here we have pairs [key offset]
-                                     x/vals x/min (remove nil?)))
-       :last-state-by-key (x/into-by-key {} ::key (comp latest-state (remove nil?)))})))
-
 
 (defn- dispatch-records!
   "Takes a map of channels to [timestamp values] and attempts to send at most as possible without blocking."
@@ -115,108 +81,6 @@
               (recur)))
           (catch Exception e
             (error "stateless-worker" e))))
-      inputs)))
-
-#_(defn- stateful-worker
-  "rf is a function of state and message value rand returns [state outs]. All outs are sent to the topic aliased :out.
-   dispatch! is a function which takes a collection as returned by f and returns a channel to which an unspecified value is written
-   when all messages have been ack'ed."
-  [rf dispatch! get-value deps-fn error {:keys [summarize cleanup progress]
-                                         :or {summarize (take 1) ; value won't be used by default (see default cleanup below)
-                                              cleanup (fn [state summary] state)}}]
-  ;; * commit can go back in time if you don't take care, commits have to be serialized
-  (fn [states-to-commit]
-    (let [inputs (a/chan)
-          kfn (fn [^ConsumerRecord r] (.key r))]
-      (a/go
-        (try
-          (loop [live-states {}]
-            (when-some [state-or-records (a/<! inputs)]
-              (if (map? state-or-records) ; startup
-                (recur (assoc live-states (::key state-or-records)
-                         (update state-or-records ::value rf)))
-                       
-                (recur (let [{:keys [updated-live-states+dones summary some-data]}
-                            (x/some
-                              (comp
-                                ; discard already processed records before performing grouping (to avoid creating empty groups)
-                                ; this may happen because restart occurs per partition and inside one partition some keys may have been
-                                ; processed further and the partition is reset at the lowest offset for all keys.
-                                (x/for [^ConsumerRecord r %
-                                        :let [k (kfn r)
-                                              offset (::offset (live-states k) -1)]
-                                        :when (< offset (.offset r))]
-                                  [k [r (get-value r)]])
-                                (x/transjuxt
-                                  {:some-data x/last
-                                   :summary (comp (x/for [[_ [_ v]] %] v) summarize)
-                                   :updated-live-states+dones
-                                   (x/into-by-key {}
-                                     (comp
-                                       (x/transjuxt
-                                         {:state+outs (x/reduce (fn
-                                                                  ([x] x)
-                                                                  ([[state outs] [r v]]
-                                                                    (let [k (kfn r)
-                                                                          state (or state (::value (live-states k)) (rf))
-                                                                          outs (or outs [])
-                                                                          [state vs] (rf state v)]
-                                                                      [state (into outs (map (fn [v] [:out k v (deps-fn v)])) vs)]))) nil)
-                                          :last-record x/last})
-                                       (map (fn [{[state outs] :state+outs [^ConsumerRecord r] :last-record}]
-                                              (let [^ConsumerRecord r r; type hint doesn't propagate on destruct!?
-                                                    done (dispatch! outs)
-                                                    commit-state {::topic (.topic r) ::partition (.partition r) ::offset (.offset r)
-                                                                  ::key (kfn r) ::value state}]
-                                                [commit-state done])))))}))
-                              state-or-records)]
-                        (if some-data
-                          (let [[states-by-done updated-live-states]
-                                (x/transjuxt
-                                  [(comp (x/for [[k [state done]] % :when done] [done state]) (x/into {}))
-                                   (comp (x/for [[k [state done]] %] [k state]) (x/into {}))]
-                                  updated-live-states+dones)
-                                live-states (into live-states updated-live-states)
-                                cleanedup-states (x/into {}
-                                                   (x/for [[k {:as state :keys [::value]}] %
-                                                           :let [value' (some-> value (cleanup summary))]
-                                                           :when (not= value value')]
-                                                     [k (assoc state ::value value')])
-                                                   live-states)
-                                all-updated-states (into updated-live-states cleanedup-states)
-                                offsets-by-tp (x/into {}
-                                                (comp
-                                                  (x/for [{:keys [::topic ::partition ::offset]} %]
-                                                    [[topic partition] [offset false]])
-                                                  (x/by-key (x/into (sorted-map))))
-                                                (vals states-by-done))]
-                           ; commit actual cleaned up states
-                           ; 1/ wait for all dones
-                           (loop [states-by-done states-by-done offsets-by-tp offsets-by-tp]
-                             (let [dones (vec (keys states-by-done))]
-                               (when (seq dones)
-                                 (let [[v done] (a/alts! dones)]
-                                   (when (nil? v)
-                                     (throw (ex-info "done channel closed" {:done done})))
-                                   (let [{:keys [::topic ::partition ::offset]} (states-by-done done)
-                                        tp [topic partition]
-                                        offsets (assoc (offsets-by-tp tp) offset true) ; flag as committed
-                                        lowest-committed (x/into []
-                                                           (x/for [[offset committed] % :while committed] offset)
-                                                           offsets)
-                                        offsets (x/without offsets lowest-committed)]
-                                    (when-some [offset (peek lowest-committed)]
-                                      (a/>! progress [topic partition :pos (inc offset)]))
-                                    (recur (dissoc states-by-done done) (assoc offsets-by-tp tp offsets)))))))
-                           ; 2/ commit
-                           (a/onto-chan states-to-commit (vals all-updated-states) false)
-                           ; remove nil states from memory
-                           (x/without (into live-states cleanedup-states)
-                             (x/for [[k v] % :when (nil? (::value v))] k)
-                             all-updated-states))
-                          live-states)))))) 
-          (catch Exception e
-            (error "stateful-worker" e))))
       inputs)))
 
 (defn wrap-traces
@@ -294,20 +158,12 @@
   "Spawns IO threads to handle kafka messages received on input-topics.
    Returns a channel, when it closes or yields a value the adapter is over.
 
-   The adapter is said to be stateful when a :state tpoic alias is present in the :outs map.
-   Else it is said to be stateless.
-
    In stateless mode, f is a function  of message value to outs (when state-topic is nil).
-   In stateful mode, f is a function of state and message value rand returns [state outs].
 
    outs is a collection of pairs [alias value] representing messages to be sent.
-   In stateful mode, a topic must be defined for aliases :out and :state.
    aliases are resolved through the topic-aliases map.
 
    In stateless mode, offsets are commited once all outputs are acknowledged.
-   In stateful mode, state is persisted to state-topic once all outputs are acknowledged
-
-   In stateful mode when there's no state for the current key, f is called with no args.
 
    By default inputs and outputs are assumed to be edn.
 
@@ -332,14 +188,13 @@
    :error, fn of string (part of the program) and exception, called when an exception occurs, should throw an exception
    :raw-in, boolean, the whole record is passed to the user function (instead of only the value part)
    :max-batch-size, integer, when set limits the number of records in each batch
-   :worker-opts, map, passed directly to the worker see stateful and stateless worker to know more about their option
+   :worker-opts, map, passed directly to the worker see stateless worker to know more about their option
    :statsd, map (required keys :host, :port; optional keys :prefix, :delimiter, :period), stateful worker will report progress
      to statsd as key value pairs, keys will be of the form group-id.topic.partition and value the offset;
-     group-id is the consuer group by default and can be configured using :prefix; :delimiter defaults to \".\"."
+     group-id is the consumer group by default and can be configured using :prefix; :delimiter defaults to \".\"."
   [f {:keys [config consumer-config producer-config input-topics timeout pause-timeout
              edn-in edn-out edn traces deps-fn key-fn exit error
              raw-in max-batch-size worker-opts topic-aliases statsd]
-;      {state-topic :state :as topic-aliases} :topic-aliases
       :or {timeout 10000
            pause-timeout 600000
            edn false
@@ -376,7 +231,7 @@
                     raw-in identity
                     edn-in (fn [^ConsumerRecord r] (->> r .value (edn/read-string {:default tagged-literal})))
                     :else (fn [^ConsumerRecord r] (-> r .value)))
-        worker-fn stateless-worker #_(if state-topic stateful-worker stateless-worker)
+        worker-fn stateless-worker 
         spawn-worker (worker-fn f dispatch-outs! get-value deps-fn error worker-opts)
         spawn-worker (if max-batch-size
                        (fn [& args]
@@ -411,9 +266,7 @@
                                      (.resume consumer (into #{} (remove to-pause) previously-paused))
                                      (.pause consumer to-pause)
                                      pending-records')))
-                  base-alt-ops [exit rebalanced to-commit] #_(if state-topic
-                                 [exit rebalanced]
-                                 [exit rebalanced to-commit])]
+                  base-alt-ops [exit rebalanced to-commit]]
               (.subscribe consumer ^java.util.Collection input-topics
                 (reify org.apache.kafka.clients.consumer.ConsumerRebalanceListener
                   (onPartitionsAssigned [_ partitions]
@@ -428,14 +281,7 @@
                     rebalanced (let [tp-to-chs' (into {} (map (fn [^TopicPartition tp]
                                                                 [tp (spawn-worker to-commit)])) v)]
                                  (doseq [ch (vals tp-to-chs)] (a/close! ch))
-                                 (recur (send-records {} tp-to-chs' records) base-alt-ops tp-to-chs')
-                                 #_(if state-topic
-                                   (let [replay-done (a/chan)]
-                                     (.pause consumer v)
-                                     (a/>!! progress [:reset])
-                                     (a/>!! replay-partitions [v replay-done])
-                                     (recur (vec records) (conj base-alt-ops replay-done) tp-to-chs'))
-                                   (recur (send-records {} tp-to-chs' records) base-alt-ops tp-to-chs')))
+                                 (recur (send-records {} tp-to-chs' records) base-alt-ops tp-to-chs'))
                     to-commit ; stateless only, when stateful dealt by a separate process since consumer is not used
                     (do ; I'm worried it could queue up, to-commit should be drained
                       (.commitAsync consumer (x/into {} (x/by-key (map #(OffsetAndMetadata. %))) v) nil)
@@ -460,73 +306,5 @@
                       ; queued records in pendirg-records are ignored as we just seeked to other positions
                       (recur {} base-alt-ops tp-to-chs))))))
             (catch Exception e
-              (error "input-thread" e))))
-        state-thread-done nil
-        #_(when state-topic
-          (let [{:keys [period] :or {period 1000}} statsd
-                partitions-assignment (a/chan (a/sliding-buffer 1))]
-            #_(when statsd
-              (a/thread ; end metrics thread, stateful only
-                (try
-                  (let [end-consumer (KafkaConsumer. ^java.util.Map (suffix-ids consumer-config "-end-metrics"))]
-                    (loop []
-                      (a/alt!!
-                        input-thread-done ([] (.close end-consumer))
-                        [partitions-assignment (a/timeout period)]
-                        ([partitions]
-                          (when partitions
-                            (some->> (.assign end-consumer partitions)))
-                          (let [partitions (.assignment end-consumer)]
-                            (.seekToEnd end-consumer partitions)
-                            (doseq [^TopicPartition partition partitions]
-                              (a/>!! progress [(.topic partition) (.partition partition) :end (.position end-consumer partition)])))
-                          (recur))
-                        :priority true)))
-                  (catch Exception e
-                    (error "state-thread" e)))))
-            (a/thread ; state replay thread
-              (try
-                (loop [^KafkaConsumer state-consumer nil end-offsets {} agg-ch nil]
-                  (let [records (some-> state-consumer (.poll timeout))
-                        [v ch] (apply a/alts!! [input-thread-done replay-partitions] :priority true (when state-consumer [:default nil]))]
-                    (condp = ch
-                      input-thread-done (some-> state-consumer .close)
-                      replay-partitions
-                      (let [[partitions done-ch] v
-                            _ (a/>!! partitions-assignment partitions)
-                            state-partitions (into #{} (map #(TopicPartition. state-topic (.partition ^TopicPartition %))) partitions)
-                            state-consumer (doto (or state-consumer (KafkaConsumer. ^java.util.Map (suffix-ids consumer-config "-replay")))
-                                             (.assign (sequence state-partitions))
-                                             (.seekToEnd state-partitions))
-                            end-offsets (into {} (map (fn [p] [p (.position state-consumer p)])) state-partitions)
-                            agg-ch (a/chan 1 (aggregate-latest-state partitions (consumer-config "auto.offset.reset" "latest")))]
-                        (a/pipe agg-ch done-ch)
-                        (.seekToBeginning state-consumer state-partitions)
-                        (recur state-consumer end-offsets agg-ch))
-                      :default ; can be hit only when state-consumer is not nil
-                      (let [end-reached (every? (fn [p] (>= (.position state-consumer p) (end-offsets p))) (keys end-offsets))]
-                        (a/>!! agg-ch records)
-                        (when end-reached
-                          (.close state-consumer)
-                          (a/close! agg-ch))
-                        (recur (when-not end-reached state-consumer) {} agg-ch)))))
-                (catch Exception e
-                  (error "state-thread" e))))))
-        state-committer-done nil
-        #_(when state-topic
-          (a/go
-            (try
-              (loop []
-                (let [[v ch] (a/alts! [to-commit state-thread-done])]
-                  (condp = ch
-                    state-thread-done (.flush producer)
-                    to-commit
-                    (when-some [commit-state v]
-                      (.send producer (ProducerRecord. state-topic (::key commit-state)
-                                        (pr-str commit-state)))
-                      (when (nil? (::value commit-state)) ; deletion -- we still need the pre-deletion state to make restart easier
-                        (.send producer (ProducerRecord. state-topic (::key commit-state) nil)))
-                      (recur)))))
-              (catch Exception e
-                (error "state-commit" e)))))]
-    (a/go (first (a/alts! [(or state-committer-done input-thread-done) error-exit])))))
+              (error "input-thread" e))))]
+    (a/go (first (a/alts! [input-thread-done error-exit])))))
